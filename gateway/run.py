@@ -2036,13 +2036,17 @@ class GatewayRunner:
             from tools.process_registry import process_registry
             while process_registry.pending_watchers:
                 watcher = process_registry.pending_watchers.pop(0)
-                asyncio.create_task(self._run_process_watcher(watcher))
+                _watch_task = asyncio.create_task(self._run_process_watcher(watcher))
+                self._background_tasks.add(_watch_task)
+                _watch_task.add_done_callback(self._background_tasks.discard)
                 logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
         except Exception as e:
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher for proactive memory flushing
-        asyncio.create_task(self._session_expiry_watcher())
+        _expiry_task = asyncio.create_task(self._session_expiry_watcher())
+        self._background_tasks.add(_expiry_task)
+        _expiry_task.add_done_callback(self._background_tasks.discard)
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -2051,7 +2055,9 @@ class GatewayRunner:
                 len(self._failed_platforms),
                 ", ".join(p.value for p in self._failed_platforms),
             )
-        asyncio.create_task(self._platform_reconnect_watcher())
+        _reconnect_task = asyncio.create_task(self._platform_reconnect_watcher())
+        self._background_tasks.add(_reconnect_task)
+        _reconnect_task.add_done_callback(self._background_tasks.discard)
 
         logger.info("Press Ctrl+C to stop")
         
@@ -4096,7 +4102,9 @@ class GatewayRunner:
                 from tools.process_registry import process_registry
                 while process_registry.pending_watchers:
                     watcher = process_registry.pending_watchers.pop(0)
-                    asyncio.create_task(self._run_process_watcher(watcher))
+                    _watch_task = asyncio.create_task(self._run_process_watcher(watcher))
+                    self._background_tasks.add(_watch_task)
+                    _watch_task.add_done_callback(self._background_tasks.discard)
             except Exception as e:
                 logger.error("Process watcher setup error: %s", e)
 
@@ -7074,9 +7082,13 @@ class GatewayRunner:
             return
 
         try:
-            self._update_notification_task = asyncio.create_task(
-                self._watch_update_progress()
-            )
+            _task = asyncio.create_task(self._watch_update_progress())
+            self._update_notification_task = _task
+            # Also track in _background_tasks so _stop_impl's cancel loop
+            # catches it on shutdown — the self attribute alone is invisible
+            # to the cleanup machinery.
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
         except RuntimeError:
             logger.debug("Skipping update notification watcher: no running event loop")
 
