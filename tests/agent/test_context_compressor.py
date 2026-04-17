@@ -64,20 +64,24 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
-    def test_truncation_fallback_no_client(self, compressor):
-        # compressor has client=None, so should use truncation fallback
+    def test_summary_failure_preserves_messages(self, compressor):
+        # When no summary provider is available, messages should be preserved (#11585)
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
         result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        # Should keep system message and last N
+        assert len(result) == len(msgs)
         assert result[0]["role"] == "system"
-        assert compressor.compression_count == 1
+        assert compressor.compression_count == 0
 
     def test_compression_increments_count(self, compressor):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Summary"
         msgs = self._make_messages(10)
-        compressor.compress(msgs)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            compressor.compress(msgs)
         assert compressor.compression_count == 1
-        compressor.compress(msgs)
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            compressor.compress(msgs)
         assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
@@ -120,7 +124,8 @@ class TestGenerateSummaryNoneContent:
         assert summary.startswith(SUMMARY_PREFIX)
 
     def test_none_content_in_system_message_compress(self):
-        """System message with content=None should not crash during compress."""
+        """System message with content=None should not crash during compress.
+        Without a summary provider the messages are preserved (#11585)."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -128,8 +133,9 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
+        # Without a working summary provider, compress preserves all messages
         result = c.compress(msgs)
-        assert len(result) < len(msgs)
+        assert len(result) == len(msgs)
 
 
 class TestNonStringContent:
@@ -781,3 +787,88 @@ class TestTokenBudgetTailProtection:
         # Tool at index 2 is outside the protected tail (last 3 = indices 2,3,4)
         # so it might or might not be pruned depending on boundary
         assert isinstance(pruned, int)
+
+
+class TestSummaryFailurePreservesMessages:
+    """Regression: when _generate_summary() returns None, the compressor must
+    preserve the original messages instead of dropping them (#11585)."""
+
+    def test_compress_returns_original_messages_on_summary_failure(self):
+        """When summarization fails (returns None), compress() should return
+        the (pruned) original messages unchanged — no middle turns dropped."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(10)
+        ]
+
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("service down")):
+            result = c.compress(msgs)
+
+        # All original messages should be preserved (no middle turns dropped)
+        assert len(result) == len(msgs)
+        # The content of every message should still be present
+        original_contents = [m["content"] for m in msgs]
+        result_contents = [m["content"] for m in result]
+        assert result_contents == original_contents
+
+    def test_compress_returns_original_on_runtime_error(self):
+        """RuntimeError (no provider configured) should also preserve messages."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(10)
+        ]
+
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            result = c.compress(msgs)
+
+        assert len(result) == len(msgs)
+
+    def test_compress_does_not_increment_count_on_failure(self):
+        """compression_count should NOT increment when summary fails and
+        messages are preserved (no actual compression happened)."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(10)
+        ]
+
+        assert c.compression_count == 0
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("fail")):
+            c.compress(msgs)
+        assert c.compression_count == 0
+
+    def test_successful_summary_still_compresses(self):
+        """Sanity check: when summary succeeds, messages ARE compressed."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Summary of conversation"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+            for i in range(10)
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        assert len(result) < len(msgs)
+        assert c.compression_count == 1

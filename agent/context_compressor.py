@@ -1073,6 +1073,20 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
+        # If LLM summary failed, preserve the original messages instead of
+        # dropping them and inserting a useless static marker.  The pruned
+        # tool results from Phase 1 are still applied (they're cheap and
+        # lossless), but the middle turns are kept intact so no information
+        # is silently lost.  (#11585)
+        if not summary:
+            if not self.quiet_mode:
+                logger.warning(
+                    "Summary generation failed — preserving original messages "
+                    "instead of dropping %d turns without a summary",
+                    compress_end - compress_start,
+                )
+            return messages
+
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
@@ -1083,20 +1097,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 if _compression_note not in existing:
                     msg["content"] = existing + "\n\n" + _compression_note
             compressed.append(msg)
-
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
-        if not summary:
-            if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
-            n_dropped = compress_end - compress_start
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"turns contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
-            )
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
