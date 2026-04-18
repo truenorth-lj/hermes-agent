@@ -339,6 +339,64 @@ class TestBackgroundInCLICommands:
         from hermes_cli.commands import COMMANDS_BY_CATEGORY
         assert "/background" in COMMANDS_BY_CATEGORY["Session"]
 
+    @pytest.mark.asyncio
+    async def test_media_files_routed_by_type(self):
+        """extract_media tuples are unpacked and routed by file extension (regression #12064)."""
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        # extract_media returns list of (path, is_voice) tuples
+        mock_adapter.extract_media = MagicMock(return_value=(
+            [
+                ("/tmp/voice.ogg", True),
+                ("/tmp/clip.mp4", False),
+                ("/tmp/photo.png", False),
+                ("/tmp/report.pdf", False),
+            ],
+            "result text",
+        ))
+        mock_adapter.extract_images = MagicMock(return_value=([], "result text"))
+        mock_adapter.send_voice = AsyncMock()
+        mock_adapter.send_video = AsyncMock()
+        mock_adapter.send_image_file = AsyncMock()
+        mock_adapter.send_document = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        mock_result = {"final_response": "MEDIA:/tmp/voice.ogg", "messages": []}
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            inst = MagicMock()
+            inst.shutdown_memory_provider = MagicMock()
+            inst.close = MagicMock()
+            inst.run_conversation.return_value = mock_result
+            MockAgent.return_value = inst
+
+            await runner._run_background_task("gen audio", source, "bg_media")
+
+        # Voice file -> send_voice
+        mock_adapter.send_voice.assert_called_once()
+        assert mock_adapter.send_voice.call_args[1]["audio_path"] == "/tmp/voice.ogg"
+
+        # Video file -> send_video
+        mock_adapter.send_video.assert_called_once()
+        assert mock_adapter.send_video.call_args[1]["video_path"] == "/tmp/clip.mp4"
+
+        # Image file -> send_image_file
+        mock_adapter.send_image_file.assert_called_once()
+        assert mock_adapter.send_image_file.call_args[1]["image_path"] == "/tmp/photo.png"
+
+        # Other file -> send_document
+        mock_adapter.send_document.assert_called_once()
+        assert mock_adapter.send_document.call_args[1]["file_path"] == "/tmp/report.pdf"
+
     def test_background_autocompletes(self):
         """The /background command appears in autocomplete results."""
         pytest.importorskip("prompt_toolkit")
