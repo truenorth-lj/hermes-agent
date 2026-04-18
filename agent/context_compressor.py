@@ -1017,7 +1017,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         """
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
-        _min_for_compress = self.protect_first_n + 3 + 1
+        # After first compression, head protection decays to 1 (system message only)
+        _effective_head = 1 if (self.compression_count > 0 and self.protect_first_n > 1) else self.protect_first_n
+        _min_for_compress = _effective_head + 3 + 1
         if n_messages <= _min_for_compress:
             if not self.quiet_mode:
                 logger.warning(
@@ -1037,7 +1039,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
 
         # Phase 2: Determine boundaries
-        compress_start = self.protect_first_n
+        # After the first compression, decay head protection to only preserve
+        # the system message (index 0).  The original user/assistant messages
+        # in positions 1..protect_first_n are already captured in the summary
+        # and would otherwise become "fossilized" — surviving every subsequent
+        # compression cycle indefinitely.  See #11996.
+        if self.compression_count > 0 and self.protect_first_n > 1:
+            compress_start = 1  # preserve only system message
+        else:
+            compress_start = self.protect_first_n
         compress_start = self._align_boundary_forward(messages, compress_start)
 
         # Use token-budget tail protection instead of fixed message count
