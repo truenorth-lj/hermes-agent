@@ -781,3 +781,167 @@ class TestTokenBudgetTailProtection:
         # Tool at index 2 is outside the protected tail (last 3 = indices 2,3,4)
         # so it might or might not be pruned depending on boundary
         assert isinstance(pruned, int)
+
+
+class TestHeadProtectionDecay:
+    """Regression tests for #11996: head messages should not fossilize across compressions.
+
+    After the first compression, head protection decays to 1 (system message only)
+    so that old user/assistant messages don't survive every subsequent compression.
+    """
+
+    def _make_mock_response(self, text="summary text"):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = text
+        return mock_response
+
+    def test_first_compression_preserves_full_head(self):
+        """On the first compression, all protect_first_n messages are preserved."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2)
+
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "first user msg"},
+            {"role": "assistant", "content": "first assistant msg"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+        ]
+
+        assert c.compression_count == 0
+        with patch("agent.context_compressor.call_llm", return_value=self._make_mock_response()):
+            result = c.compress(msgs)
+
+        # First user msg and first assistant msg should be preserved verbatim
+        assert result[0]["content"].startswith("system prompt")
+        assert any(m.get("content") == "first user msg" for m in result)
+        assert any(m.get("content") == "first assistant msg" for m in result)
+        assert c.compression_count == 1
+
+    def test_second_compression_decays_head_protection(self):
+        """After first compression, head protection decays — only system message is protected."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2)
+
+        # Simulate first compression already happened
+        c.compression_count = 1
+
+        # Build a post-compression message list: system + old user + old assistant + summary + tail
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "fossilized question from hours ago"},
+            {"role": "assistant", "content": "fossilized answer from hours ago"},
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious summary..."},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=self._make_mock_response()):
+            result = c.compress(msgs)
+
+        # The fossilized messages should NOT be preserved verbatim —
+        # they should be included in the compression window
+        preserved_contents = [m.get("content", "") for m in result]
+        assert "fossilized question from hours ago" not in preserved_contents
+        assert "fossilized answer from hours ago" not in preserved_contents
+        # System message should always be preserved
+        assert any("system prompt" in (m.get("content") or "") for m in result)
+
+    def test_system_message_always_preserved(self):
+        """System message (index 0) must survive all compressions regardless of count."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2)
+
+        # Even after many compressions
+        c.compression_count = 5
+
+        msgs = [
+            {"role": "system", "content": "important system prompt"},
+            {"role": "user", "content": "old msg"},
+            {"role": "assistant", "content": "old reply"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=self._make_mock_response()):
+            result = c.compress(msgs)
+
+        assert result[0]["role"] == "system"
+        assert "important system prompt" in result[0]["content"]
+
+    def test_protect_first_1_no_decay(self):
+        """When protect_first_n=1, there's nothing to decay (only system message)."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2)
+
+        c.compression_count = 3  # multiple compressions
+
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "assistant", "content": "msg 2"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=self._make_mock_response()):
+            result = c.compress(msgs)
+
+        # Should still work — system message preserved
+        assert result[0]["role"] == "system"
+        assert c.compression_count == 4
+
+    def test_multiple_compressions_dont_fossilize(self):
+        """Simulate 3 compression cycles and verify head messages don't accumulate."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=3, protect_last_n=2)
+
+        # Cycle 1: original messages
+        msgs = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "original question"},
+            {"role": "assistant", "content": "original answer"},
+            {"role": "user", "content": "follow up 1"},
+            {"role": "assistant", "content": "reply 1"},
+            {"role": "user", "content": "follow up 2"},
+            {"role": "assistant", "content": "reply 2"},
+            {"role": "user", "content": "follow up 3"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=self._make_mock_response("cycle 1 summary")):
+            result1 = c.compress(msgs)
+
+        assert c.compression_count == 1
+        # original question and answer should be in result1 (first compression preserves them)
+        r1_contents = [m.get("content", "") for m in result1]
+        assert "original question" in r1_contents
+
+        # Cycle 2: add more messages to the compressed result
+        result1.extend([
+            {"role": "assistant", "content": "new reply A"},
+            {"role": "user", "content": "new question B"},
+            {"role": "assistant", "content": "new reply B"},
+            {"role": "user", "content": "new question C"},
+            {"role": "assistant", "content": "new reply C"},
+        ])
+
+        with patch("agent.context_compressor.call_llm", return_value=self._make_mock_response("cycle 2 summary")):
+            result2 = c.compress(result1)
+
+        assert c.compression_count == 2
+        # After second compression, "original question" should NOT be preserved verbatim
+        r2_contents = [m.get("content", "") for m in result2]
+        assert "original question" not in r2_contents
+        # But system message should still be there
+        assert any("system" in c for c in r2_contents)
