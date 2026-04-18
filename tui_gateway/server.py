@@ -1022,10 +1022,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 fn = tc.get("function", {})
                 tc_id = tc.get("id", "")
                 if tc_id and fn.get("name"):
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
+                    from utils import repair_tool_call_json
+                    args = repair_tool_call_json(fn.get("arguments", "{}"))
                     tool_call_args[tc_id] = (fn["name"], args)
             if not (m.get("content") or "").strip():
                 continue

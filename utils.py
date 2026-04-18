@@ -177,6 +177,121 @@ def safe_json_loads(text: str, default: Any = None) -> Any:
         return default
 
 
+def repair_tool_call_json(raw: str) -> dict:
+    """Parse a tool-call argument JSON string with best-effort repair.
+
+    LLM backends like llama.cpp sometimes produce invalid JSON in tool-call
+    arguments — most commonly unescaped apostrophes/single-quotes inside
+    string values (e.g. ``{"summary": "The user's notes"}``).
+
+    This function tries ``json.loads`` first, then applies lightweight
+    heuristic repairs before giving up and returning an empty dict.
+
+    Returns:
+        Parsed dict on success, or ``{}`` if the JSON is unrecoverable.
+    """
+    if not raw or not raw.strip():
+        return {}
+
+    # Fast path: valid JSON
+    try:
+        result = json.loads(raw)
+        return result if isinstance(result, dict) else {}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    # ── Repair pass 1: fix unescaped control characters ──────────────
+    # llama.cpp sometimes emits literal control chars (tabs, newlines)
+    # inside JSON string values.  json.loads(raw, strict=False) handles
+    # this without any string manipulation.
+    try:
+        result = json.loads(raw, strict=False)
+        return result if isinstance(result, dict) else {}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    # ── Repair pass 2: unescaped single quotes inside double-quoted strings ──
+    # Pattern: the LLM writes  "The user's notes"  which is valid English
+    # but the apostrophe sometimes appears as a stray single-quote that
+    # breaks certain parser paths, or the LLM uses single-quoted strings
+    # instead of double-quoted ones.
+    import re
+
+    repaired = raw
+
+    # Replace single-quoted JSON strings with double-quoted ones.
+    # This handles the case where the LLM uses Python-style single quotes
+    # for the entire JSON object (e.g. {'key': 'value'}).
+    if repaired.strip().startswith("{") and "'" in repaired:
+        # Try replacing single quotes used as string delimiters.
+        # Strategy: outside of double-quoted strings, replace ' with "
+        # but only when they appear to be string delimiters.
+        try:
+            # Attempt: replace all single-quote delimiters with double quotes.
+            # This is safe when the original has no double-quoted strings.
+            if '"' not in repaired:
+                candidate = repaired.replace("'", '"')
+                result = json.loads(candidate)
+                if isinstance(result, dict):
+                    return result
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    # ── Repair pass 3: escape unescaped backslashes & control chars ──
+    # Try to fix common escape issues by re-encoding problematic chars
+    # within string values.
+    try:
+        # Walk through the string and escape characters that are invalid
+        # inside JSON strings: unescaped newlines, tabs, etc.
+        fixed = _escape_invalid_chars_in_json_strings(repaired)
+        if fixed != repaired:
+            result = json.loads(fixed)
+            if isinstance(result, dict):
+                return result
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    logger.warning("Could not repair tool-call JSON: %.200s", raw)
+    return {}
+
+
+def _escape_invalid_chars_in_json_strings(raw: str) -> str:
+    """Escape unescaped control characters inside JSON string values.
+
+    Walks the raw JSON character-by-character, tracking whether we are
+    inside a double-quoted string.  Inside strings, replaces literal
+    control characters (0x00-0x1F except already-escaped sequences)
+    with their ``\\uXXXX`` equivalents.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_string:
+            if ch == '\\' and i + 1 < n:
+                # Escaped char — pass through as-is
+                out.append(ch)
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+            elif ord(ch) < 0x20:
+                # Unescaped control character inside string
+                out.append(f'\\u{ord(ch):04x}')
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
 # ─── Environment Variable Helpers ─────────────────────────────────────────────
 
 

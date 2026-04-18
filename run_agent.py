@@ -106,7 +106,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from utils import atomic_json_write, env_var_enabled
+from utils import atomic_json_write, env_var_enabled, repair_tool_call_json
 
 
 
@@ -276,20 +276,12 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     reserved_paths: list[Path] = []
     for tool_call in tool_calls:
         tool_name = tool_call.function.name
-        try:
-            function_args = json.loads(tool_call.function.arguments)
-        except Exception:
+        function_args = repair_tool_call_json(tool_call.function.arguments)
+        if not function_args and tool_call.function.arguments and tool_call.function.arguments.strip():
             logging.debug(
                 "Could not parse args for %s — defaulting to sequential; raw=%s",
                 tool_name,
                 tool_call.function.arguments[:200],
-            )
-            return False
-        if not isinstance(function_args, dict):
-            logging.debug(
-                "Non-dict args for %s (%s) — defaulting to sequential",
-                tool_name,
-                type(function_args).__name__,
             )
             return False
 
@@ -2747,15 +2739,12 @@ class AIAgent:
                     # Add tool calls wrapped in XML tags
                     for tool_call in msg["tool_calls"]:
                         if not tool_call or not isinstance(tool_call, dict): continue
-                        # Parse arguments - should always succeed since we validate during conversation
-                        # but keep try-except as safety net
-                        try:
-                            arguments = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
-                        except json.JSONDecodeError:
-                            # This shouldn't happen since we validate and retry during conversation,
-                            # but if it does, log warning and use empty dict
-                            logging.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
-                            arguments = {}
+                        # Parse arguments — repair malformed JSON from backends like llama.cpp
+                        raw_args = tool_call["function"]["arguments"]
+                        if isinstance(raw_args, str):
+                            arguments = repair_tool_call_json(raw_args)
+                        else:
+                            arguments = raw_args if isinstance(raw_args, dict) else {}
                         
                         tool_call_json = {
                             "name": tool_call["function"]["name"],
@@ -7395,7 +7384,7 @@ class AIAgent:
             for tc in tool_calls:
                 if tc.function.name == "memory":
                     try:
-                        args = json.loads(tc.function.arguments)
+                        args = repair_tool_call_json(tc.function.arguments)
                         flush_target = args.get("target", "memory")
                         from tools.memory_tool import memory_tool as _memory_tool
                         _memory_tool(
@@ -7689,12 +7678,7 @@ class AIAgent:
             elif function_name == "skill_manage":
                 self._iters_since_skill = 0
 
-            try:
-                function_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                function_args = {}
-            if not isinstance(function_args, dict):
-                function_args = {}
+            function_args = repair_tool_call_json(tool_call.function.arguments)
 
             # Checkpoint for file-mutating tools
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
@@ -7973,13 +7957,7 @@ class AIAgent:
 
             function_name = tool_call.function.name
 
-            try:
-                function_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                logging.warning(f"Unexpected JSON error after validation: {e}")
-                function_args = {}
-            if not isinstance(function_args, dict):
-                function_args = {}
+            function_args = repair_tool_call_json(tool_call.function.arguments)
 
             # Check plugin hooks for a block directive before executing.
             _block_msg: Optional[str] = None

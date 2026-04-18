@@ -345,12 +345,12 @@ class MiniSWERunner:
                     # Add tool calls in XML format
                     for tool_call in msg["tool_calls"]:
                         if not tool_call or not isinstance(tool_call, dict): continue
-                        try:
-                            arguments = json.loads(tool_call["function"]["arguments"]) \
-                                if isinstance(tool_call["function"]["arguments"], str) \
-                                else tool_call["function"]["arguments"]
-                        except json.JSONDecodeError:
-                            arguments = {}
+                        from utils import repair_tool_call_json
+                        raw_args = tool_call["function"]["arguments"]
+                        if isinstance(raw_args, str):
+                            arguments = repair_tool_call_json(raw_args)
+                        else:
+                            arguments = raw_args if isinstance(raw_args, dict) else {}
                         
                         tool_call_json = {
                             "name": tool_call["function"]["name"],
@@ -495,10 +495,8 @@ Complete the user's task step by step."""
                     
                     # Execute each tool call
                     for tc in assistant_message.tool_calls:
-                        try:
-                            args = json.loads(tc.function.arguments)
-                        except json.JSONDecodeError:
-                            args = {}
+                        from utils import repair_tool_call_json
+                        args = repair_tool_call_json(tc.function.arguments)
                         
                         command = args.get("command", "echo 'No command provided'")
                         timeout = args.get("timeout", self.command_timeout)
