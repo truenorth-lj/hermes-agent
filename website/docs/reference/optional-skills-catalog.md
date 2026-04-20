@@ -149,6 +149,7 @@ The largest optional category — covers the full ML pipeline from data curation
 | Skill | Description |
 |-------|-------------|
 | **1password** | Set up and use 1Password CLI (op). Install the CLI, enable desktop app integration, sign in, and read/inject secrets for commands. |
+| **defi-risk-analysis** | Analyze a DeFi protocol's risk profile across smart-contract, off-chain, and track-record dimensions. Governance-first checks, audited-vs-deployed drift detection, GoPlus/Safe/Etherscan/Solana RPC integrations. Not a formal audit. |
 | **oss-forensics** | Open-source software forensics — analyze packages, dependencies, and supply chain risks. |
 | **sherlock** | OSINT username search across 400+ social networks. Hunt down social media accounts by username. |
 
